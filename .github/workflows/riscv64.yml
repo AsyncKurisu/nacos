@@ -1,0 +1,180 @@
+# Copyright 1999-2026 Alibaba Group Holding Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: RISC-V64 JDK 17 Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nacos-riscv64-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_IMAGE: riscv64/ubuntu:24.04
+      CONTAINER_NAME: nacos-riscv64-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare run directory
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/nacos-riscv64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf 'RUN_DIR=%s\n' "$RUN_DIR" >> "$GITHUB_ENV"
+          mkdir "$RUN_DIR"
+          mkdir -p "$RUN_DIR"/{m2,home,reports,artifacts}
+          {
+            printf 'commit=%s\nrunner=%s\nimage=%s\n' "$(git rev-parse HEAD)" "$RUNNER_NAME" "$BUILD_IMAGE"
+            printf 'scope=RISC-V64 QEMU user-mode build; all tests skipped\n'
+            printf 'source.status:\n'
+            git status --short
+            docker version
+          } > "$RUN_DIR/reports/environment.txt" 2>&1
+
+      - name: Set up QEMU for RISC-V64
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: riscv64
+
+      - name: Restore Maven cache
+        id: maven-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.RUN_DIR }}/m2
+          key: ${{ runner.os }}-riscv64-ubuntu24-jdk17-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties', '**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-riscv64-ubuntu24-jdk17-wrapper-
+
+      - name: Build standard release with APT tools (skip all tests)
+        id: build
+        timeout-minutes: 300
+        run: |
+          set -euo pipefail
+          docker run --rm --init --name "$CONTAINER_NAME" --platform linux/riscv64 \
+            --label "nacos.riscv64.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
+            --mount "type=bind,source=$RUN_DIR/m2,target=/cache/m2" \
+            --mount "type=bind,source=$RUN_DIR/home,target=/work/home" \
+            --mount "type=bind,source=$RUN_DIR/reports,target=/reports" \
+            --mount "type=bind,source=$RUN_DIR/artifacts,target=/artifacts" \
+            --env "BUILD_UID=$(id -u)" --env "BUILD_GID=$(id -g)" \
+            --env HOME=/work/home --env MAVEN_USER_HOME=/cache/m2 \
+            --env MAVEN_OPTS=-Duser.home=/work/home --env LC_ALL=C.UTF-8 \
+            --workdir /workspace -i "$BUILD_IMAGE" bash -euo pipefail <<'CONTAINER' 2>&1 \
+            | tee "$RUN_DIR/reports/build.log"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 update
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
+            openjdk-17-jdk-headless ca-certificates curl git unzip util-linux \
+            protobuf-compiler protobuf-compiler-grpc-java-plugin
+          rm -rf /var/lib/apt/lists/*
+          exec setpriv --reuid="$BUILD_UID" --regid="$BUILD_GID" --clear-groups \
+            bash -euo pipefail <<'BUILD'
+          test "$(uname -m)" = riscv64
+          test -x /usr/bin/protoc
+          test -x /usr/bin/grpc_java_plugin
+          java_info=$(java -XshowSettings:properties -version 2>&1)
+          printf '%s\n' "$java_info" >> /reports/environment.txt
+          grep -Eq 'java.specification.version = 17$' <<< "$java_info"
+          grep -Eq 'os.arch = riscv64$' <<< "$java_info"
+          {
+            uname -a
+            cat /etc/os-release
+            dpkg-query -W protobuf-compiler protobuf-compiler-grpc-java-plugin
+            /usr/bin/protoc --version
+            ./mvnw -version
+          } 2>&1 | tee -a /reports/environment.txt
+          ./mvnw -B "-Dmaven.repo.local=$MAVEN_USER_HOME/repository" \
+            '-Prelease-nacos,!dev' -Dmaven.test.skip=true \
+            -DprotocExecutable=/usr/bin/protoc \
+            -DprotocPluginExecutable=/usr/bin/grpc_java_plugin \
+            clean install
+          mapfile -d '' packages < <(find distribution/target -maxdepth 1 -type f \
+            -name 'nacos-server-*.tar.gz' -print0)
+          test "${#packages[@]}" -eq 1
+          cp "${packages[0]}" /artifacts/
+          (cd /artifacts && sha256sum ./*.tar.gz > SHA256SUMS)
+          # Cache dependencies and the Wrapper distribution, not this checkout's installed artifacts.
+          rm -rf "$MAVEN_USER_HOME/repository/com/alibaba/nacos"
+          find "$MAVEN_USER_HOME/repository" -type f \
+            \( -name '*.lastUpdated' -o -name '*.part' -o -name '*.part.lock' \) -delete
+          BUILD
+          CONTAINER
+
+      - name: Save Maven cache
+        if: steps.build.outcome == 'success' && steps.maven-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.RUN_DIR }}/m2
+          key: ${{ steps.maven-cache.outputs.cache-primary-key }}
+
+      - name: Stop remaining build container
+        id: cleanup
+        if: always()
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          cid=$(docker ps -aq --filter "name=^/${CONTAINER_NAME}$")
+          if [[ -n $cid ]]; then
+            owner=$(docker inspect --format '{{index .Config.Labels "nacos.riscv64.run"}}' "$cid")
+            test "$owner" = "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            timeout 90 docker stop --time 60 "$cid" || timeout 20 docker kill "$cid"
+            remaining=$(docker ps -aq --filter "name=^/${CONTAINER_NAME}$")
+            if [[ -n $remaining ]]; then
+              timeout 20 docker rm "$remaining" || {
+                remaining=$(docker ps -aq --filter "name=^/${CONTAINER_NAME}$")
+                test -z "$remaining"
+              }
+            fi
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-build-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nacos-riscv64-${{ github.run_id }}-${{ github.run_attempt }}/reports/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload standard release
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nacos-riscv64-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary run files
+        if: always() && steps.cleanup.outcome == 'success'
+        run: |
+          set -euo pipefail
+          RUN_DIR="${RUN_DIR:-$RUNNER_TEMP/nacos-riscv64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT}"
+          test "${RUN_DIR%/*}" = "$RUNNER_TEMP"
+          rm -rf -- "$RUN_DIR"
