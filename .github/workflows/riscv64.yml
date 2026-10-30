@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: RISC-V64 JDK 17 Build
+name: RISC-V64 JDK 17 Build and Selected IT
 
 on:
   workflow_dispatch:
@@ -21,11 +21,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: nacos-riscv64-build
+  group: nacos-riscv64-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     defaults:
@@ -47,14 +47,13 @@ jobs:
           RUN_DIR="$RUNNER_TEMP/nacos-riscv64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           printf 'RUN_DIR=%s\n' "$RUN_DIR" >> "$GITHUB_ENV"
           mkdir "$RUN_DIR"
-          mkdir -p "$RUN_DIR"/{m2,home,reports,artifacts}
-          {
-            printf 'commit=%s\nrunner=%s\nimage=%s\n' "$(git rev-parse HEAD)" "$RUNNER_NAME" "$BUILD_IMAGE"
-            printf 'scope=RISC-V64 QEMU user-mode build; all tests skipped\n'
-            printf 'source.status:\n'
-            git status --short
-            docker version
-          } > "$RUN_DIR/reports/environment.txt" 2>&1
+          mkdir -p "$RUN_DIR"/{m2,home}
+          printf 'runner=%s\nimage=%s\n' "$RUNNER_NAME" "$BUILD_IMAGE"
+          printf 'virtualization=QEMU user-mode via binfmt_misc; Docker platform=linux/riscv64\n'
+          printf 'Host OS: '
+          sed -n 's/^PRETTY_NAME=//p' /etc/os-release
+          uname -a
+          docker version --format 'Docker Engine: {{.Server.Version}}'
 
       - name: Set up QEMU for RISC-V64
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -70,9 +69,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-riscv64-ubuntu24-jdk17-wrapper-
 
-      - name: Build standard release with APT tools (skip all tests)
-        id: build
-        timeout-minutes: 300
+      - name: Build standard release and run selected IT on RISC-V64
+        id: build-test
+        timeout-minutes: 345
         run: |
           set -euo pipefail
           docker run --rm --init --name "$CONTAINER_NAME" --platform linux/riscv64 \
@@ -80,17 +79,15 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
             --mount "type=bind,source=$RUN_DIR/m2,target=/cache/m2" \
             --mount "type=bind,source=$RUN_DIR/home,target=/work/home" \
-            --mount "type=bind,source=$RUN_DIR/reports,target=/reports" \
-            --mount "type=bind,source=$RUN_DIR/artifacts,target=/artifacts" \
             --env "BUILD_UID=$(id -u)" --env "BUILD_GID=$(id -g)" \
             --env HOME=/work/home --env MAVEN_USER_HOME=/cache/m2 \
-            --env MAVEN_OPTS=-Duser.home=/work/home --env LC_ALL=C.UTF-8 \
-            --workdir /workspace -i "$BUILD_IMAGE" bash -euo pipefail <<'CONTAINER' 2>&1 \
-            | tee "$RUN_DIR/reports/build.log"
+            --env JAVA_TOOL_OPTIONS=-Duser.home=/work/home --env LC_ALL=C.UTF-8 \
+            --workdir /workspace -i "$BUILD_IMAGE" bash -euo pipefail <<'CONTAINER'
           export DEBIAN_FRONTEND=noninteractive
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 update
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
             openjdk-17-jdk-headless ca-certificates curl git unzip util-linux \
+            openssl procps libatomic1 \
             protobuf-compiler protobuf-compiler-grpc-java-plugin
           rm -rf /var/lib/apt/lists/*
           exec setpriv --reuid="$BUILD_UID" --regid="$BUILD_GID" --clear-groups \
@@ -99,35 +96,177 @@ jobs:
           test -x /usr/bin/protoc
           test -x /usr/bin/grpc_java_plugin
           java_info=$(java -XshowSettings:properties -version 2>&1)
-          printf '%s\n' "$java_info" >> /reports/environment.txt
           grep -Eq 'java.specification.version = 17$' <<< "$java_info"
           grep -Eq 'os.arch = riscv64$' <<< "$java_info"
-          {
-            uname -a
-            cat /etc/os-release
-            dpkg-query -W protobuf-compiler protobuf-compiler-grpc-java-plugin
-            /usr/bin/protoc --version
-            ./mvnw -version
-          } 2>&1 | tee -a /reports/environment.txt
-          ./mvnw -B "-Dmaven.repo.local=$MAVEN_USER_HOME/repository" \
+          printf 'Container OS: '
+          sed -n 's/^PRETTY_NAME=//p' /etc/os-release
+          uname -a
+          java -version
+          printf '%s\n' "$java_info" | grep -E 'os.arch = riscv64$'
+          printf 'System dependencies:\n'
+          dpkg-query -W -f='${binary:Package}=${Version}\n' \
+            libc6 libatomic1 ca-certificates curl git unzip util-linux openssl procps \
+            protobuf-compiler protobuf-compiler-grpc-java-plugin
+          /usr/bin/protoc --version
+          ./mvnw -version
+
+          mvn_repo="$MAVEN_USER_HOME/repository"
+          # Never resolve modules from a previous Nacos checkout.
+          rm -rf "$mvn_repo/com/alibaba/nacos"
+          ./mvnw -B -e "-Dmaven.repo.local=$mvn_repo" \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
             '-Prelease-nacos,!dev' -Dmaven.test.skip=true \
             -DprotocExecutable=/usr/bin/protoc \
             -DprotocPluginExecutable=/usr/bin/grpc_java_plugin \
             clean install
-          mapfile -d '' packages < <(find distribution/target -maxdepth 1 -type f \
-            -name 'nacos-server-*.tar.gz' -print0)
+          shopt -s nullglob
+          packages=(distribution/target/nacos-server-*.tar.gz)
           test "${#packages[@]}" -eq 1
-          cp "${packages[0]}" /artifacts/
-          (cd /artifacts && sha256sum ./*.tar.gz > SHA256SUMS)
+
+          it_home="$HOME/nacos-riscv64-selected-it"
+          mkdir -p "$it_home"
+          tar -xzf "${packages[0]}" -C "$it_home"
+          NACOS_HOME="$it_home/nacos"
+          PROP_FILE="$NACOS_HOME/conf/application.properties"
+          # Preserve the packaged auth scopes and authorization cache defaults.
+          grep -Fxq 'nacos.core.auth.enabled=true' "$PROP_FILE"
+          grep -Fxq 'nacos.core.auth.admin.enabled=true' "$PROP_FILE"
+          grep -Fxq 'nacos.core.auth.console.enabled=true' "$PROP_FILE"
+
+          export NACOS_TEST_AUTH_ADMIN_USERNAME=nacos
+          export NACOS_TEST_AUTH_CLIENT_USERNAME=nacos_it_client_rw
+          export NACOS_TEST_AUTH_READONLY_USERNAME=nacos_it_client_readonly
+          export NACOS_TEST_AUTH_NO_PERMISSION_USERNAME=nacos_it_client_no_permission
+          NACOS_TEST_AUTH_ADMIN_PASSWORD="NacosIt-$(openssl rand -hex 16)-A1!"
+          NACOS_TEST_AUTH_CLIENT_PASSWORD="NacosIt-$(openssl rand -hex 16)-C1!"
+          NACOS_TEST_AUTH_READONLY_PASSWORD="NacosIt-$(openssl rand -hex 16)-R1!"
+          NACOS_TEST_AUTH_NO_PERMISSION_PASSWORD="NacosIt-$(openssl rand -hex 16)-N1!"
+          NACOS_TEST_AUTH_TOKEN_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
+          NACOS_TEST_AUTH_SERVER_IDENTITY_KEY="nacos-it-$(openssl rand -hex 8)"
+          NACOS_TEST_AUTH_SERVER_IDENTITY_VALUE="$(openssl rand -hex 32)"
+          export NACOS_TEST_AUTH_ADMIN_PASSWORD NACOS_TEST_AUTH_CLIENT_PASSWORD
+          export NACOS_TEST_AUTH_READONLY_PASSWORD NACOS_TEST_AUTH_NO_PERMISSION_PASSWORD
+          export NACOS_TEST_AUTH_TOKEN_SECRET
+          export NACOS_TEST_AUTH_SERVER_IDENTITY_KEY NACOS_TEST_AUTH_SERVER_IDENTITY_VALUE
+          for secret in \
+            "$NACOS_TEST_AUTH_ADMIN_PASSWORD" \
+            "$NACOS_TEST_AUTH_CLIENT_PASSWORD" \
+            "$NACOS_TEST_AUTH_READONLY_PASSWORD" \
+            "$NACOS_TEST_AUTH_NO_PERMISSION_PASSWORD" \
+            "$NACOS_TEST_AUTH_TOKEN_SECRET" \
+            "$NACOS_TEST_AUTH_SERVER_IDENTITY_KEY" \
+            "$NACOS_TEST_AUTH_SERVER_IDENTITY_VALUE"; do
+            printf '::add-mask::%s\n' "$secret"
+          done
+          sed -i \
+            "s|^nacos.plugin.auth.nacos.token.secret.key=.*|nacos.plugin.auth.nacos.token.secret.key=$NACOS_TEST_AUTH_TOKEN_SECRET|" \
+            "$PROP_FILE"
+          sed -i \
+            "s|^nacos.core.auth.server.identity.key=.*|nacos.core.auth.server.identity.key=$NACOS_TEST_AUTH_SERVER_IDENTITY_KEY|" \
+            "$PROP_FILE"
+          sed -i \
+            "s|^nacos.core.auth.server.identity.value=.*|nacos.core.auth.server.identity.value=$NACOS_TEST_AUTH_SERVER_IDENTITY_VALUE|" \
+            "$PROP_FILE"
+
+          server_pid=''
+          cleanup_it() {
+            local status=$?
+            trap - EXIT
+            if (( status != 0 )); then
+              echo '::group::Nacos startup diagnostics'
+              tail -n 150 "$NACOS_HOME/logs/startup.log" 2>/dev/null || true
+              tail -n 150 "$NACOS_HOME/logs/nacos.log" 2>/dev/null || true
+              echo '::endgroup::'
+            fi
+            if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+              if ps -p "$server_pid" -o args= | grep -Fq -- "-Dnacos.home=$NACOS_HOME "; then
+                kill "$server_pid" 2>/dev/null || true
+                for _ in $(seq 1 20); do
+                  kill -0 "$server_pid" 2>/dev/null || break
+                  sleep 1
+                done
+                if kill -0 "$server_pid" 2>/dev/null; then
+                  kill -9 "$server_pid" 2>/dev/null || true
+                  for _ in $(seq 1 5); do
+                    kill -0 "$server_pid" 2>/dev/null || break
+                    sleep 1
+                  done
+                fi
+                if kill -0 "$server_pid" 2>/dev/null; then
+                  echo 'Nacos cleanup failed: process still exists' >&2
+                  (( status != 0 )) || status=1
+                fi
+              else
+                echo 'Nacos cleanup refused: PID ownership mismatch' >&2
+                (( status != 0 )) || status=1
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_it EXIT
+
+          echo 'Starting Nacos standalone on RISC-V64...'
+          bash "$NACOS_HOME/bin/startup.sh" -m standalone
+          for _ in $(seq 1 40); do
+            server_pid=$(pgrep -f -- "-Dnacos.home=$NACOS_HOME " | head -n 1 || true)
+            [[ -n "$server_pid" ]] && break
+            sleep 1
+          done
+          test -n "$server_pid"
+
+          ready=false
+          ready_deadline=$((SECONDS + 600))
+          while (( SECONDS < ready_deadline )); do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo 'Nacos exited before becoming ready' >&2
+              exit 1
+            fi
+            remaining=$((ready_deadline - SECONDS))
+            (( remaining > 0 )) || break
+            request_timeout=$((remaining < 3 ? remaining : 3))
+            if curl --silent --show-error --fail --max-time "$request_timeout" \
+              http://127.0.0.1:8080/v3/console/health/readiness >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            echo 'Nacos readiness timed out after 600 seconds' >&2
+            exit 1
+          fi
+          echo 'Nacos readiness check passed.'
+          timeout 600 bash test/scripts/auth-it-identity.sh bootstrap >/dev/null
+          timeout 600 bash test/scripts/auth-it-identity.sh prepare >/dev/null
+
+          echo 'Running selected Java SDK integration tests...'
+          ./mvnw -B -e "-Dmaven.repo.local=$mvn_repo" \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            -pl test/java-sdk-test -Pjava-sdk-integration-test \
+            -Dmaven.test.skip=false -DskipTests=false \
+            -Dnacos.test.auth.enabled=true \
+            '-Dit.test=ConfigServiceJavaSdkITCase#testPublishQueryCasAndRemoveConfig,NamingServiceJavaSdkITCase#testRegisterQuerySelectListAndDeregisterInstance' \
+            clean verify
+
+          echo 'Running selected OpenAPI integration test...'
+          ./mvnw -B -e "-Dmaven.repo.local=$mvn_repo" \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            -pl test/openapi-test -Pintegration-test \
+            -Dmaven.test.skip=false -DskipTests=false \
+            -Dnacos.test.auth.enabled=true \
+            '-Dit.test=ConfigOpenApiITCase#testGetConfigSuccessAfterPublish' \
+            clean verify
+          echo 'Selected RISC-V64 IT passed.'
+
           # Cache dependencies and the Wrapper distribution, not this checkout's installed artifacts.
-          rm -rf "$MAVEN_USER_HOME/repository/com/alibaba/nacos"
-          find "$MAVEN_USER_HOME/repository" -type f \
+          rm -rf "$mvn_repo/com/alibaba/nacos"
+          find "$mvn_repo" -type f \
             \( -name '*.lastUpdated' -o -name '*.part' -o -name '*.part.lock' \) -delete
           BUILD
           CONTAINER
 
       - name: Save Maven cache
-        if: steps.build.outcome == 'success' && steps.maven-cache.outputs.cache-hit != 'true'
+        if: steps.build-test.outcome == 'success' && steps.maven-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.RUN_DIR }}/m2
@@ -152,24 +291,6 @@ jobs:
               }
             fi
           fi
-
-      - name: Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: riscv64-build-reports-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/nacos-riscv64-${{ github.run_id }}-${{ github.run_attempt }}/reports/
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload standard release
-        if: always() && steps.build.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: riscv64-release-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/nacos-riscv64-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/
-          if-no-files-found: error
-          retention-days: 14
 
       - name: Remove temporary run files
         if: always() && steps.cleanup.outcome == 'success'
