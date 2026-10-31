@@ -133,6 +133,10 @@ jobs:
           grep -Fxq 'nacos.core.auth.admin.enabled=true' "$PROP_FILE"
           grep -Fxq 'nacos.core.auth.console.enabled=true' "$PROP_FILE"
 
+          # Allow extra time for Derby's first connection under QEMU.
+          printf '\nnacos.plugin.datasource.db.pool.config.connection-timeout=30000\n' >> "$PROP_FILE"
+          echo 'QEMU Derby connection timeout: 30000 ms'
+
           export NACOS_TEST_AUTH_ADMIN_USERNAME=nacos
           export NACOS_TEST_AUTH_CLIENT_USERNAME=nacos_it_client_rw
           export NACOS_TEST_AUTH_READONLY_USERNAME=nacos_it_client_readonly
@@ -177,6 +181,15 @@ jobs:
               tail -n 150 "$NACOS_HOME/logs/startup.log" 2>/dev/null || true
               tail -n 150 "$NACOS_HOME/logs/nacos.log" 2>/dev/null || true
               echo '::endgroup::'
+              echo '::group::Nacos SDK connection diagnostics'
+              local sdk_log
+              for sdk_log in "$HOME"/logs/nacos/{remote,naming,config}.log; do
+                [[ -f "$sdk_log" ]] || continue
+                printf '\n%s\n' "${sdk_log##*/}"
+                tail -n 100 "$sdk_log" \
+                  | sed -E 's/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' || true
+              done
+              echo '::endgroup::'
             fi
             if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
               if ps -p "$server_pid" -o args= | grep -Fq -- "-Dnacos.home=$NACOS_HOME "; then
@@ -215,7 +228,9 @@ jobs:
           test -n "$server_pid"
 
           ready=false
-          ready_deadline=$((SECONDS + 600))
+          # Merged deployment starts Core, Server Web and Console in sequence under QEMU.
+          ready_timeout=1200
+          ready_deadline=$((SECONDS + ready_timeout))
           while (( SECONDS < ready_deadline )); do
             if ! kill -0 "$server_pid" 2>/dev/null; then
               echo 'Nacos exited before becoming ready' >&2
@@ -232,12 +247,24 @@ jobs:
             sleep 1
           done
           if [[ "$ready" != true ]]; then
-            echo 'Nacos readiness timed out after 600 seconds' >&2
+            echo "Nacos readiness timed out after $ready_timeout seconds" >&2
+            curl --silent --show-error --max-time 3 \
+              --write-out '\nReadiness HTTP status: %{http_code}\n' \
+              http://127.0.0.1:8080/v3/console/health/readiness || true
             exit 1
           fi
           echo 'Nacos readiness check passed.'
           timeout 600 bash test/scripts/auth-it-identity.sh bootstrap >/dev/null
           timeout 600 bash test/scripts/auth-it-identity.sh prepare >/dev/null
+
+          # HTTP readiness does not cover each SDK client's gRPC handshake or health checks.
+          # Apply QEMU budgets to Maven and its test fork, after starting the server.
+          JAVA_TOOL_OPTIONS+=' -Dnacos.remote.client.grpc.server.check.timeout=30000'
+          JAVA_TOOL_OPTIONS+=' -Dnacos.remote.client.grpc.channel.capability.negotiation.timeout=30000'
+          JAVA_TOOL_OPTIONS+=' -Dnacos.remote.client.grpc.health.timeout=30000'
+          JAVA_TOOL_OPTIONS+=' -Dnacos.remote.client.grpc.timeout=30000'
+          export JAVA_TOOL_OPTIONS
+          echo 'QEMU SDK gRPC connection, negotiation, health and default request timeouts: 30000 ms'
 
           echo 'Running selected Java SDK integration tests...'
           ./mvnw -B -e "-Dmaven.repo.local=$mvn_repo" \
